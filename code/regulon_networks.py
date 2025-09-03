@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from sklearn.decomposition import PCA, NMF, FastICA
 import igraph as ig
 import random
 import warnings
@@ -119,6 +120,137 @@ def GRN_to_TF_edges(
         )
 
     return TF_edges
+
+
+
+
+def _build_similarity_matrix(TF_edges, weight_col='similarity'):
+    """Helper function to construct the dense TF-TF similarity matrix."""
+    print("Constructing the full TF-TF similarity matrix...")
+    all_tfs = pd.unique(TF_edges[['TF_x', 'TF_y']].values.ravel('K'))
+    all_tfs.sort()
+    
+    tf_matrix = pd.DataFrame(0, index=all_tfs, columns=all_tfs, dtype=np.float64)
+    pivoted = TF_edges.pivot(index='TF_x', columns='TF_y', values=weight_col)
+    tf_matrix.update(pivoted)
+    tf_matrix = tf_matrix + tf_matrix.T
+    np.fill_diagonal(tf_matrix.values, 1.0)
+    tf_matrix.fillna(0, inplace=True)
+    return tf_matrix
+
+
+def perform_soft_clustering(
+    TF_edges, 
+    method='pca', 
+    n_components=20, 
+    weight_col='similarity',
+    random_seed=42
+):
+    """
+    Performs dimensionality reduction on the full TF-TF similarity matrix for soft clustering.
+
+    This function avoids edge thresholding by using the dense similarity matrix to find 
+    major axes of variation (components), which can be interpreted as continuous 
+    community assignments.
+
+    Args:
+        TF_edges (pd.DataFrame): DataFrame with ['TF_x', 'TF_y', weight_col].
+        method (str): The method to use. One of 'pca', 'nmf', or 'ica'.
+        n_components (int or 'auto'): The number of components to extract. If 'auto',
+                                      the function will try to find an optimal number.
+        weight_col (str): The column containing the similarity score.
+        random_seed (int): Seed for reproducibility for NMF and ICA.
+
+    Returns:
+        tuple: A tuple containing:
+            - pd.DataFrame: A tidy DataFrame of TF loadings for each component.
+            - pd.Series or None: Importance of each component (variance explained for PCA,
+              None for other methods).
+    """
+    tf_matrix = _build_similarity_matrix(TF_edges, weight_col)
+
+    print(f"Running {method.upper()} on the {tf_matrix.shape[0]}x{tf_matrix.shape[1]} matrix...")
+    
+    # --- Automatic selection of n_components ---
+    if n_components == 'auto':
+        if method == 'nmf':
+            print("Finding optimal n_components for NMF using reconstruction error elbow...")
+            k_range = range(2, 15) 
+            errors = []
+            for k in tqdm(k_range, desc="Testing k for NMF"):
+                model = NMF(n_components=k, init='random', random_state=random_seed, max_iter=200)
+                model.fit(tf_matrix)
+                errors.append(model.reconstruction_err_)
+            
+            # Find the elbow point
+            # We look for the point with the maximum perpendicular distance from the line
+            # connecting the first and last points of the error curve.
+            points = np.column_stack((k_range, errors))
+            line_vec = points[-1] - points[0]
+            line_vec_norm = line_vec / np.sqrt(np.sum(line_vec**2))
+            vec_from_first = points - points[0]
+            scalar_product = np.sum(vec_from_first * np.tile(line_vec_norm, (len(k_range), 1)), axis=1)
+            vec_from_first_parallel = np.outer(scalar_product, line_vec_norm)
+            vec_to_line_perp = vec_from_first - vec_from_first_parallel
+            dist_to_line = np.sqrt(np.sum(vec_to_line_perp**2, axis=1))
+            
+            n_components = k_range[np.argmax(dist_to_line)]
+            print(f"Optimal n_components for NMF found: {n_components}")
+
+        elif method == 'ica':
+            print("Finding optimal n_components for ICA using PCA variance heuristic...")
+            pca = PCA()
+            pca.fit(tf_matrix)
+            cumsum_var = np.cumsum(pca.explained_variance_ratio_)
+            # Find the number of components to explain 95% of variance
+            n_components = np.argmax(cumsum_var >= 0.95) + 1
+            print(f"Optimal n_components for ICA (explaining 95% variance): {n_components}")
+        
+        elif method == 'pca':
+            print("For PCA, 'auto' uses n_components=20. PCA returns variance explained for all components.")
+            n_components = 20
+
+    # --- Run final model with selected n_components ---
+    model_params = {'n_components': n_components, 'random_state': random_seed}
+    loadings_matrix = None
+    importance_series = None
+    
+    if method == 'pca':
+        model = PCA(**model_params)
+        model.fit(tf_matrix)
+        loadings_matrix = model.components_.T
+        importance_series = pd.Series(model.explained_variance_ratio_, name='importance')
+    
+    elif method == 'nmf':
+        model = NMF(**model_params, init='random', max_iter=500)
+        loadings_matrix = model.fit_transform(tf_matrix)
+        
+    elif method == 'ica':
+        model = FastICA(**model_params, max_iter=500)
+        loadings_matrix = model.fit_transform(tf_matrix)
+        
+    else:
+        raise ValueError("Method must be one of 'pca', 'nmf', or 'ica'")
+
+    # --- Format results into a tidy DataFrame ---
+    comp_names = [f'{method}{i+1}' for i in range(n_components)]
+    
+    tf_loadings = (pd.DataFrame(loadings_matrix, columns=comp_names, index=tf_matrix.index)
+                   .melt(ignore_index=False, var_name='Component', value_name='Loading')
+                   .assign(Component=lambda x: pd.Categorical(x['Component'], categories=comp_names, ordered=True))
+                   .reset_index(names='TF')
+                   )
+    
+    if importance_series is not None:
+        importance_series.index = comp_names
+
+    print(f"{method.upper()} complete.")
+    return tf_loadings, importance_series
+
+
+
+
+
 
 
 
@@ -332,6 +464,7 @@ def plot_TF_graph(g, enrichment=None, random_seed=5, width_modifier=2, target=No
     # Use edge width to define layout
     graph_design = {}
     graph_design["layout"] = g.layout("fr", weights=[w for w in g.es["log_weight"]])
+    # graph_design["layout"] = g.layout("kamada_kawai", weights=[w for w in g.es["log_weight"]])
 
     # Colour by C1-3
     if enrichment is not None:

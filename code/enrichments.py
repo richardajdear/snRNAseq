@@ -348,16 +348,15 @@ def get_magma_geneset_enrichments(input_table,
     return results
 
 
-def GRN_magma_enrichment(GRN, mapping=None):
+def GRN_magma_enrichment(GRN, mapping=None, method='geneset'):
     """
     Perform MAGMA enrichment analysis for a given gene regulatory network (GRN).
     """
     # Map gene symbols to entrez IDs
-    network_magma_input = GRN.loc[:, ['Network', 'Gene']].drop_duplicates()
     if mapping is not None:
-        network_magma_input = network_magma_input.join(mapping.set_index('Gene'), on='Gene', how='inner')
+        network_magma_input = GRN.join(mapping.set_index('Gene'), on='Gene', how='inner')
     else:
-        network_magma_input = (network_magma_input
+        network_magma_input = (GRN
                .pipe(symbol2entrez)
                .loc[lambda x: x['entrezgene'].notnull()]
             #    .pipe(symbol2ensembl)
@@ -365,17 +364,39 @@ def GRN_magma_enrichment(GRN, mapping=None):
     )
 
     # Get MAGMA enrichments
-    network_magma_SCZ = get_magma_geneset_enrichments(network_magma_input, 
-    input_name = 'GRN',
-    gwas_name = 'SCZ',
-    gwas_map_name = 'magma',
-    col='3,1'
-    )
-    network_magma_MDD = get_magma_geneset_enrichments(network_magma_input, 
-        input_name = 'GRN',
-        gwas_name = 'MDD2025',
-        gwas_map_name = 'magma',
-        col='3,1'
+    if method=='geneset':
+        # Select columns for magma geneset
+        network_magma_input = network_magma_input.loc[:, ['Network', 'entrezgene']].drop_duplicates()
+
+        network_magma_SCZ = get_magma_geneset_enrichments(network_magma_input, 
+            input_name = 'GRN',
+            gwas_name = 'SCZ',
+            gwas_map_name = 'magma',
+            col='2,1'
+        )
+        network_magma_MDD = get_magma_geneset_enrichments(network_magma_input, 
+            input_name = 'GRN',
+            gwas_name = 'MDD2025',
+            gwas_map_name = 'magma',
+            col='2,1'
+            )
+    elif method=='covar':
+        # Pivot to format for magma covar
+        network_magma_input = (network_magma_input
+            .pivot(index='entrezgene', columns='Network', values='Importance').reset_index()
+        )
+
+        network_magma_SCZ = get_magma_geneset_enrichments(network_magma_input, 
+            input_name = 'GRN',
+            gwas_name = 'SCZ',
+            gwas_map_name = 'magma',
+            method = 'covar'
+        )
+        network_magma_MDD = get_magma_geneset_enrichments(network_magma_input, 
+            input_name = 'GRN',
+            gwas_name = 'MDD2025',
+            gwas_map_name = 'magma',
+            method = 'covar'
         )
 
     network_magma_results = (pd.concat({
